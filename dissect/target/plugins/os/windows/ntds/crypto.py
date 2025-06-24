@@ -1,7 +1,6 @@
-import hashlib
-import logging
 from binascii import Error as binascii_Error
 from binascii import hexlify, unhexlify
+from hashlib import md5 as md5_func
 from struct import pack, unpack
 
 from Crypto.Util.Padding import unpad
@@ -48,9 +47,9 @@ typedef struct {
 
 c_ntds_crypto = cstruct().load(ntds_crypto_def)
 
-PEKLIST_ENC = c_ntds_crypto.structs.PEKLIST_ENC
-PEKLIST_PLAIN = c_ntds_crypto.structs.PEKLIST_PLAIN
-PEK_KEY = c_ntds_crypto.structs.PEK_KEY
+PEKLIST_ENC = c_ntds_crypto.PEKLIST_ENC
+PEKLIST_PLAIN = c_ntds_crypto.PEKLIST_PLAIN
+PEK_KEY = c_ntds_crypto.PEK_KEY
 
 
 # Wrapper for ENC_SECRET
@@ -80,7 +79,7 @@ class ENC_SECRET:
             self.struct = c_ntds_crypto.structs.ENC_SECRET_WIN2K(data)
             self.is_rc4 = True
         else:
-            logging.error(f"Unknown algorithm ID {self.algo_id} in secret")
+            # logging.error(f"Unknown algorithm ID {self.algo_id} in secret")
             raise ValueError(f"Unknown algorithm ID: {self.algo_id}")
 
         self.algo_type = next(k for k, v in self.SECRET_ENCRYPTION_ALGORITHMS.items() if v == self.algo_id)
@@ -136,7 +135,7 @@ FILETYPE_PEM = "PEM"
 FILETYPE_ASN1 = "DER"
 
 
-def format_asn1_to_pem(data: bytes):
+def format_asn1_to_pem(data: bytes) -> str:
     try:  # is it hex encoded?
         cert = load_certificate(FILETYPE_ASN1, unhexlify(data))
     except binascii_Error:  # or raw bytes?
@@ -144,16 +143,16 @@ def format_asn1_to_pem(data: bytes):
     return dump_certificate(FILETYPE_PEM, cert).decode()
 
 
-def deriveKey(baseKey):
-    key = pack("<L", baseKey)
+def derive_key(base_key) -> tuple[bytes, bytes]:
+    key = pack("<L", base_key)
     key1 = [key[0], key[1], key[2], key[3], key[0], key[1], key[2]]
     key2 = [key[3], key[0], key[1], key[2], key[3], key[0], key[1]]
 
     return transform_key(bytes(key1)), transform_key(bytes(key2))
 
 
-def decryptAES(key, value, iv=b"\x00" * 16):
-    plainText = b""
+def decrypt_aes(key, value, iv=b"\x00" * 16) -> bytes:
+    plain_text = b""
     if iv != b"\x00" * 16:
         aes256 = AES.new(key, AES.MODE_CBC, iv)
 
@@ -164,47 +163,47 @@ def decryptAES(key, value, iv=b"\x00" * 16):
         # Pad buffer to 16 bytes
         if len(cipherBuffer) < 16:
             cipherBuffer += b"\x00" * (16 - len(cipherBuffer))
-        plainText += aes256.decrypt(cipherBuffer)
+        plain_text += aes256.decrypt(bytearray(cipherBuffer))
     try:
-        return unpad(plainText, 16)
+        return unpad(plain_text, 16)
     except ValueError:
         # data is certainly unpadded
-        return plainText
+        return plain_text
 
 
 class PEK_LIST:
     def __init__(self, rawEncPekList: bytes, bootKey: bytes):
-        self.__encryptedPekList = PEKLIST_ENC(rawEncPekList)
-        self.__decryptedPekList = None
-        self.__bootKey = bootKey
-        self.plainPekList = list()
+        self.encrypted_pek_list = PEKLIST_ENC(rawEncPekList)
+        self.decrypted_pek_list = None
+        self.boot_key = bootKey
+        self.plain_pek_list = []
 
-        if self.__encryptedPekList["Header"][:4] == b"\x02\x00\x00\x00":
+        if self.encrypted_pek_list["Header"][:4] == b"\x02\x00\x00\x00":
             # Up to Windows 2012 R2 looks like header starts this way
-            md5 = hashlib.new("md5")
-            md5.update(self.__bootKey)
-            for i in range(1000):
-                md5.update(self.__encryptedPekList["KeyMaterial"])
-            tmpKey = md5.digest()
-            rc4 = ARC4.new(tmpKey)
-            self.__decryptedPekList = PEKLIST_PLAIN(rc4.encrypt(self.__encryptedPekList["EncryptedPek"]))
+            md5 = md5_func()
+            md5.update(self.boot_key)
+            for _ in range(1000):
+                md5.update(self.encrypted_pek_list["KeyMaterial"])
+            tmp_key = md5.digest()
+            rc4 = ARC4.new(tmp_key)
+            self.decrypted_pek_list = PEKLIST_PLAIN(rc4.encrypt(self.encrypted_pek_list["EncryptedPek"]))
             pek_len = len(PEK_KEY())
-            for i in range(len(self.__decryptedPekList["DecryptedPek"]) // pek_len):
+            for i in range(len(self.decrypted_pek_list["DecryptedPek"]) // pek_len):
                 cursor = i * pek_len
-                pek = PEK_KEY(self.__decryptedPekList["DecryptedPek"][cursor : cursor + pek_len])
-                logging.info("PEK # %d found and decrypted: %s", i, hexlify(pek["Key"]).decode("utf-8"))
-                self.plainPekList.append(pek["Key"])
+                pek = PEK_KEY(self.decrypted_pek_list["DecryptedPek"][cursor : cursor + pek_len])
+                # logging.info("PEK # %d found and decrypted: %s", i, hexlify(pek["Key"]).decode("utf-8"))
+                self.plain_pek_list.append(pek["Key"])
 
-        elif self.__encryptedPekList["Header"][:4] == b"\x03\x00\x00\x00":
+        elif self.encrypted_pek_list["Header"][:4] == b"\x03\x00\x00\x00":
             # Windows 2016 TP4 header starts this way
             # Encrypted PEK Key seems to be different, but actually similar to decrypting LSA Secrets.
             # using AES:
             # Key: the bootKey
             # CipherText: PEKLIST_ENC['EncryptedPek']
             # IV: PEKLIST_ENC['KeyMaterial']
-            self.__decryptedPekList = PEKLIST_PLAIN(
-                decryptAES(
-                    self.__bootKey, self.__encryptedPekList["EncryptedPek"], self.__encryptedPekList["KeyMaterial"]
+            self.decrypted_pek_list = PEKLIST_PLAIN(
+                decrypt_aes(
+                    self.boot_key, self.encrypted_pek_list["EncryptedPek"], self.encrypted_pek_list["KeyMaterial"]
                 )
             )
 
@@ -214,32 +213,30 @@ class PEK_LIST:
             # by an entry with a non-sequential index (08080808 observed)
             pos, cur_index = 0, 0
             while True:
-                pek_entry = self.__decryptedPekList["DecryptedPek"][pos : pos + 20]
+                pek_entry = self.decrypted_pek_list["DecryptedPek"][pos : pos + 20]
                 if len(pek_entry) < 20:
                     break  # if list truncated, should not happen
                 index, pek = unpack("<L16s", pek_entry)
                 if index != cur_index:
                     break  # break on non-sequential index
-                self.plainPekList.append(pek)
-                logging.info("PEK # %d found and decrypted: %s", index, hexlify(pek).decode("utf-8"))
+                self.plain_pek_list.append(pek)
+                # logging.info("PEK # %d found and decrypted: %s", index, hexlify(pek).decode("utf-8"))
                 cur_index += 1
                 pos += 20
 
-    def removeRC4Layer(self, encSecret: ENC_SECRET) -> str:
-        md5 = hashlib.new("md5")
-        md5.update(self.plainPekList[int(encSecret["PekID"])])
+    def removeRC4Layer(self, encSecret: ENC_SECRET) -> bytes:
+        md5 = md5_func()
+        md5.update(self.plain_pek_list[int(encSecret["PekID"])])
         md5.update(encSecret["Salt"])
         tmpKey = md5.digest()
         rc4 = ARC4.new(tmpKey)
-        plainText = rc4.encrypt(encSecret["EncryptedData"])
-        return plainText
+        return rc4.encrypt(encSecret["EncryptedData"])
 
     def __removeDESLayer(self, cipher: bytes, rid: str) -> str:
-        Key1, Key2 = deriveKey(int(rid))
+        Key1, Key2 = derive_key(int(rid))
         Crypt1 = DES.new(Key1, DES.MODE_ECB)
         Crypt2 = DES.new(Key2, DES.MODE_ECB)
-        plainText = Crypt1.decrypt(cipher[:8]) + Crypt2.decrypt(cipher[8:])
-        return plainText
+        return Crypt1.decrypt(cipher[:8]) + Crypt2.decrypt(cipher[8:])
 
     def decryptSecret(
         self, rawSecret: bytes, rid: bytes = b"", isHistory: bool = False, hasDES: bool = True, isADAM: bool = False
@@ -247,10 +244,10 @@ class PEK_LIST:
         try:
             encSecret = ENC_SECRET(rawSecret)
         except ValueError as e:
-            logging.exception(e)
+            # logging.exception(e)
             return "DEC_ERROR_INIT"
         except Exception as e:
-            logging.exception(e)
+            # logging.exception(e)
             return "DEC_ERROR_UNK"
         if hasattr(encSecret, "is_rc4"):
             tmpPlain = self.removeRC4Layer(encSecret)
@@ -259,8 +256,8 @@ class PEK_LIST:
             # return "TO:DO:RC4:PASS:RID"
         elif hasattr(encSecret, "is_aes"):
             # encSecret.dump()
-            tmpPlain = decryptAES(
-                self.plainPekList[int(encSecret["PekID"])], encSecret["EncryptedData"], encSecret["Salt"]
+            tmpPlain = decrypt_aes(
+                self.plain_pek_list[int(encSecret["PekID"])], encSecret["EncryptedData"], encSecret["Salt"]
             )
 
         if isADAM:

@@ -114,8 +114,9 @@ KERBEROS_TYPE = {
 
 
 class NTDS:
-    def __init__(self, ntds_path: TargetPath):
-        self.ntds_database = EseDB(self.ntds_path.open())
+    def __init__(self, ntds_path: TargetPath, boot_key: bytes):
+        self.ntds_database: EseDB = EseDB(ntds_path.open())
+        self.boot_key: bytes = boot_key
 
         self.datatable = self.ntds_database.table("datatable")
         self.linktable = self.ntds_database.table("link_table")
@@ -135,27 +136,26 @@ class NTDS:
 
         self.securityDescriptors = {}
 
-        self.pekList = None
-        self.rawEncPekList = None
+        self.pek_list = None
+        self.raw_enc_pek_list = None
         self.ldap_naming = False  # TODO: Make as arg
-        self.__isADAM = False  # AD LDS format
+        self.is_adam = False  # AD LDS format
 
         self.__KDSRootKeys = []
 
         # For ADAM
-        self.__schemaPekList = None
-        self.__rootPekList = None
+        self.schema_pek_list = None
+        self.root_pek_list = None
 
         self.__build_schemas()
-        self.__decryptPekList()
+        self.__decrypt_pek_list()
 
     def __build_schemas(self) -> None:
-        def updateAttributeSchema(aid: int, cn_name: str, ldap_name: str):
+        def update_attribute_schema(aid: int, cn_name: str, ldap_name: str) -> None:
             self.attribute_schema["resolve"][self.datatable_columns_mapping.get(aid)] = (cn_name, ldap_name)
             self.attribute_schema["cn"][cn_name] = self.datatable_columns_mapping.get(aid)
             self.attribute_schema["ldap"][ldap_name] = self.datatable_columns_mapping.get(aid)
 
-        seen = 0
         OCLID_classSchema = 196621
         OCLID_attributeSchema = 196622
         OCLID_domainDNS = 655427
@@ -166,7 +166,7 @@ class NTDS:
         OCLID_KDSProvRootKey = 655638
 
         # logging.debug("Parsing the sdtable")
-        for record in self.__sdtable.records():
+        for record in self.sdtable.records():
             try:
                 self.securityDescriptors[str(record.get("sd_id"))] = record.get("sd_value")
             except Exception:
@@ -203,81 +203,94 @@ class NTDS:
 
         # logging.debug("Parsing the datatable")
         for record in self.datatable.records():
-            seen += 1
-
             if record is None:
                 break
 
             if OCLID_classSchema in self.get_object_class(record):
-                id = str(record.get(NAME_TO_INTERNAL["Governs-ID"]))
-                ldap_name = record.get(NAME_TO_INTERNAL["Attribute-Name-LDAP"])
-                cn_name = record.get(NAME_TO_INTERNAL["Attribute-Name-CN"])
+                id = str(record.get(NAME_TO_INTERNAL["governs_id"]))
+                ldap_name = record.get(NAME_TO_INTERNAL["attribute_name_ldap"])
+                cn_name = record.get(NAME_TO_INTERNAL["attribute_name_common_name"])
                 self.object_class_schema["resolve"][id] = (cn_name, ldap_name)
                 self.object_class_schema["ldap"][ldap_name] = id
                 self.object_class_schema["cn"][cn_name] = id
 
             elif OCLID_attributeSchema in self.get_object_class(record):
-                attId = record.get(NAME_TO_INTERNAL["Attribute-ID"])
-                msdsId = record.get(NAME_TO_INTERNAL["msDS-IntId"])
-                ldap_name = record.get(NAME_TO_INTERNAL["Attribute-Name-LDAP"])
-                cn_name = record.get(NAME_TO_INTERNAL["Attribute-Name-CN"])
-                lid = record.get(NAME_TO_INTERNAL["Link-ID"])
+                attId = record.get(NAME_TO_INTERNAL["attribute_id"])
+                msdsId = record.get(NAME_TO_INTERNAL["ms_ds_int_id"])
+                ldap_name = record.get(NAME_TO_INTERNAL["attribute_name_ldap"])
+                cn_name = record.get(NAME_TO_INTERNAL["attribute_name_common_name"])
+                lid = record.get(NAME_TO_INTERNAL["link_id"])
 
                 if isinstance(lid, int):
                     self.attribute_schema["links"][str(lid)] = (cn_name, ldap_name)
 
                 if attId in self.datatable_columns_mapping:
-                    updateAttributeSchema(attId, cn_name, ldap_name)
+                    update_attribute_schema(attId, cn_name, ldap_name)
                 elif msdsId in self.datatable_columns_mapping:
-                    updateAttributeSchema(msdsId, cn_name, ldap_name)
+                    update_attribute_schema(msdsId, cn_name, ldap_name)
                 else:
                     self.attribute_schema["unresolved"][ldap_name] = (
                         self.datatable_columns_mapping.get(attId, attId),
                         self.datatable_columns_mapping.get(msdsId, msdsId),
                         cn_name,
                     )
-            elif not self.rawEncPekList and (
+            elif not self.raw_enc_pek_list and (
                 OCLID_domainDNS in self.get_object_class(record)
-                and record.get(NAME_TO_INTERNAL["Pek-List"]) is not None
+                and record.get(NAME_TO_INTERNAL["pek_list"]) is not None
             ):
-                self.__isADAM = False
-                self.rawEncPekList = hexlify(record.get(NAME_TO_INTERNAL["Pek-List"])).decode()
-                # logging.debug("Found Pek-List")
-            elif [OCLID_top] == self.get_object_class(record) and record.get(NAME_TO_INTERNAL["Pek-List"]) is not None:
-                self.__isADAM = True
-                self.__rootPekList = record.get(NAME_TO_INTERNAL["Pek-List"])
+                self.is_adam = False
+                self.raw_enc_pek_list = hexlify(record.get(NAME_TO_INTERNAL["pek_list"])).decode()
+                # logging.debug("Found pek_list")
+            elif [OCLID_top] == self.get_object_class(record) and record.get(NAME_TO_INTERNAL["pek_list"]) is not None:
+                self.is_adam = True
+                self.root_pek_list = record.get(NAME_TO_INTERNAL["pek_list"])
                 # logging.debug("ADAM_NTDS : Found rootPekList (len:%s)" % len(self.__rootPekList))
-            elif OCLID_dMD in self.get_object_class(record) and record.get(NAME_TO_INTERNAL["Pek-List"]) is not None:
-                self.__isADAM = True
-                self.__schemaPekList = record.get(NAME_TO_INTERNAL["Pek-List"])
+            elif OCLID_dMD in self.get_object_class(record) and record.get(NAME_TO_INTERNAL["pek_list"]) is not None:
+                self.is_adam = True
+                self.schema_pek_list = record.get(NAME_TO_INTERNAL["pek_list"])
                 # logging.debug("ADAM_NTDS : Found schemaPekList (len:%s)" % len(self.__schemaPekList))
             elif (
                 OCLID_configuration in self.get_object_class(record)
-                and record.get(NAME_TO_INTERNAL["Pek-List"]) is not None
+                and record.get(NAME_TO_INTERNAL["pek_list"]) is not None
             ):
-                self.__isADAM = True
-                self.rawEncPekList = hexlify(record.get(NAME_TO_INTERNAL["Pek-List"])).decode()
-                # logging.debug("ADAM_NTDS : Found Pek-List")
+                self.is_adam = True
+                self.raw_enc_pek_list = hexlify(record.get(NAME_TO_INTERNAL["pek_list"])).decode()
+                # logging.debug("ADAM_NTDS : Found pek_list")
             elif OCLID_KDSProvRootKey in self.get_object_class(record):
                 self.__KDSRootKeys.append(self.get_object_class(record))
                 # logging.debug("Found a RootKey for MS-GKDI")
 
         # logging.debug("Building distinguished names...")
 
-    def __decryptPekList(self) -> None:
-        if self.rawEncPekList is not None and self.target.lsa.syskey is not None:
-            self.pekList = PEK_LIST(unhexlify(self.rawEncPekList), self.target.lsa.syskey)
+    def __decrypt_pek_list(self) -> None:
+        if self.raw_enc_pek_list is not None and self.boot_key is not None:
+            self.pek_list = PEK_LIST(unhexlify(self.raw_enc_pek_list), self.boot_key)
 
     def get_object_class(self, record: Record) -> list[int]:
-        rOC = record.get(NAME_TO_INTERNAL["object_class"])
+        """
+        Extracts the object class identifier(s) from a record.
 
-        if isinstance(rOC, list):
-            return rOC
+        Args:
+            record (Record): The record from which to extract the object class field.
 
-        return [rOC] if rOC else []
+        Returns:
+            list[int]: A list of object class IDs. Returns an empty list if the field is missing or empty.
+        """
+        record_object_class = record.get(NAME_TO_INTERNAL["object_class"])
 
-    def __translate(self, name: str) -> str:
-        if isinstance(name, str):
-            ocsid = str(self.object_class_schema["ldap" if True else "cn"].get(name, -1))
-            return self.object_class_schema["resolve"].get(ocsid, ["", ""])[not True]
-        return name
+        if isinstance(record_object_class, list):
+            return record_object_class
+
+        return [record_object_class] if record_object_class else []
+
+    def extract_object_id_name(self, object_id: int) -> tuple[str, str] | None:
+        """Retrieves the common name and LDAP name associated with a given object ID.
+
+        Args:
+            object_id (int): The numerical object identifier to look up.
+
+        Returns:
+            tuple[str, str] | None: A tuple containing (common_name, ldap_name) if found,
+            or None if the object ID is not present in the schema.
+        """
+        return self.object_class_schema["resolve"].get(str(object_id))
