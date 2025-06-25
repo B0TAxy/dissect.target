@@ -42,14 +42,7 @@ class NtdsPlugin(Plugin):
 
     @export(record=NtdsUserRecord, description="Extract data from NTDS.dit database file")
     @arg("--skip-deleted", action="store_true", help="Skip deleted records")
-    def test_ntds(self, skip_deleted: bool = False) -> Iterator[NtdsUserRecord]:
+    def records(self, skip_deleted: bool = False) -> Iterator[NtdsUserRecord]:
         ntds = NTDS(self.ntds_path, self.target.lsa.syskey)
-        for record in ntds.datatable.records():
-            if record.get(NAME_TO_INTERNAL["is_deleted"]) and skip_deleted:
-                continue
 
-            id_to_names_mapping = {
-                object_id: ntds.extract_object_id_name(object_id)
-                for object_id in [object_class for object_class in ntds.get_object_class(record) if object_class]
-            }
-            print(id_to_names_mapping)
+        yield from ntds.dump_ntds_dit(skip_deleted)
